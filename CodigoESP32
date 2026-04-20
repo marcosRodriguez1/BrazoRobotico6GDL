@@ -1,0 +1,398 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <math.h>
+
+#define PI 3.14159265358979323846
+
+// ---------- WiFi ----------
+const char* ssid = "SSID_24";
+const char* password = "9ftrueba5";
+WiFiServer server(80);
+
+// ---------- Escalado de coordenadas desde móvil ----------
+const float tablero_lado_largo_m = 0.60;
+const float pantalla_movil_alto_m = 0.1521;
+const float escala_global = tablero_lado_largo_m / pantalla_movil_alto_m;
+
+// ---------- Altura fija (Z) ----------
+#define ALTURA_FIJA 50.0  // mm
+
+// ---------- Estructura Motor ----------
+struct Motor {
+  const char* name;
+  int in1, in2, ena;
+  int encA, encB;
+  int pwmChannel;
+  long pulsesPerTurn;
+  float Kp, Ki, Kd;
+
+  volatile long encoderCount = 0;
+  float targetDegrees = 0;
+  long targetPulses = 0;
+  float controlSignal = 0;
+  float previousError = 0;
+  float errorIntegral = 0;
+  unsigned long previousTime = 0;
+};
+
+Motor motorBase;
+Motor motorHombro;
+Motor motorCodo;
+Motor motorpala;
+
+// Variables globales para tareas
+float x_recibido = 0.0;
+float y_recibido = 0.0;
+bool nuevaTarea = false;
+const float x_deposito_fijo = 0.1;
+const float y_deposito_fijo = 0.2;
+
+// ---------- Funciones auxiliares ----------
+double rad_to_deg(double rad) { return rad * 180.0 / PI; }
+double deg_to_rad(double deg) { return deg * PI / 180.0; }
+
+// ---------- Cinemática inversa ----------
+bool cinematicaInversa(double x, double y, double z, double L1, double L2,
+    double* theta1, double* theta2, double* theta3) {
+
+  *theta1 = atan2(y, x);
+  double R = sqrt(x * x + y * y);
+  double D = (R * R + z * z - L1 * L1 - L2 * L2) / (2.0 * L1 * L2);
+
+  if (D < -1.0 || D > 1.0) return false;
+
+  double theta3_options[2] = 
+  {
+    atan2(sqrt(1.0 - D * D), D),
+    atan2(-sqrt(1.0 - D * D), D)
+  };
+
+  for (int i = 0; i < 2; i++) {
+    double t3 = theta3_options[i];
+    double beta = atan2(z, R);
+    double alpha = atan2(L2 * sin(t3), L1 + L2 * cos(t3));
+    double t2 = beta - alpha;
+    if (t2 >= deg_to_rad(10) && t2 <= deg_to_rad(90)) {
+      *theta2 = t2;
+      *theta3 = t3;
+      return true;
+    }
+  }
+
+  return false;
+}
+
+//-----------PROTOTIPOS PALA-------
+void moverPalaAGrados(float gradosObjetivo);
+
+//-----------PROTOTIPO MOVIMIENTO----
+void irDeRecogidaADeposito(float x_recogida, float y_recogida, float x_deposito, float y_deposito);
+
+
+
+// ---------- Encoder ISR ----------
+void readEncoderBase() {
+  if (digitalRead(motorBase.encB)) motorBase.encoderCount++;
+  else motorBase.encoderCount--;
+}
+
+void readEncoderHombro() {
+  if (digitalRead(motorHombro.encB)) motorHombro.encoderCount++;
+  else motorHombro.encoderCount--;
+}
+
+void readEncoderCodo() {
+  if (digitalRead(motorCodo.encB)) motorCodo.encoderCount++;
+  else motorCodo.encoderCount--;
+}
+
+// ---------- PID ----------
+void updatePID(Motor& m) {
+  unsigned long now = micros();
+  float dt = (now - m.previousTime) / 1e6;
+  m.previousTime = now;
+
+  float error = m.targetPulses - m.encoderCount;
+  float dError = (error - m.previousError) / dt;
+
+  float toleranciaGrados = 2.0;
+  if (fabs(error) < ((m.pulsesPerTurn / 360.0) * toleranciaGrados)) {
+    m.controlSignal = 0;
+    m.errorIntegral = 0;
+    return;
+  }
+
+  m.errorIntegral += error * dt;
+  m.controlSignal = m.Kp * error + m.Ki * m.errorIntegral + m.Kd * dError;
+
+  m.controlSignal = constrain(m.controlSignal, -255, 255);
+
+  m.previousError = error;
+}
+
+// ---------- Motor driver ----------
+void driveMotor(Motor& m) {
+  int pwm = (int)fabs(m.controlSignal);
+  pwm = constrain(pwm, 0, 255);
+  int pwmMin = 30;
+  if (pwm > 0 && pwm < pwmMin) pwm = pwmMin;
+
+  if (m.controlSignal > 0) {
+    digitalWrite(m.in1, HIGH); digitalWrite(m.in2, LOW);
+  } else if (m.controlSignal < 0) {
+    digitalWrite(m.in1, LOW); digitalWrite(m.in2, HIGH);
+  } else {
+    digitalWrite(m.in1, LOW); digitalWrite(m.in2, LOW);
+  }
+
+  ledcWrite(m.pwmChannel, pwm);
+}
+
+// ---------- Debug Serial ----------
+void debugPrint() {
+  float posBase = ((float)motorBase.encoderCount / motorBase.pulsesPerTurn) * 360.0;
+  float posHombro = ((float)motorHombro.encoderCount / motorHombro.pulsesPerTurn) * 360.0;
+  float posCodo = ((float)motorCodo.encoderCount / motorCodo.pulsesPerTurn) * 360.0;
+
+  Serial.print("[Base] Objetivo: "); Serial.print(motorBase.targetDegrees);
+  Serial.print(" ° | Actual: "); Serial.print(posBase);
+  Serial.print(" ° | PWM: "); Serial.println(motorBase.controlSignal);
+
+  Serial.print("[Hombro] Objetivo: "); Serial.print(motorHombro.targetDegrees);
+  Serial.print(" ° | Actual: "); Serial.print(posHombro);
+  Serial.print(" ° | PWM: "); Serial.println(motorHombro.controlSignal);
+
+  Serial.print("[Codo] Objetivo: "); Serial.print(motorCodo.targetDegrees);
+  Serial.print(" ° | Actual: "); Serial.print(posCodo);
+  Serial.print(" ° | PWM: "); Serial.println(motorCodo.controlSignal);
+
+  Serial.println();
+}
+
+// ---------- SETUP ----------
+void setup() 
+{
+  Serial.begin(115200);
+
+   // Base
+  motorBase.name = "Base";
+  motorBase.in1 = 0; motorBase.in2 = 2; motorBase.ena = 25;
+  motorBase.encA = 21; motorBase.encB = 22;
+  motorBase.pwmChannel = 0;
+  motorBase.pulsesPerTurn = 6600 * 1.5;
+  motorBase.Kp = 4.0; motorBase.Ki = 0.00005; motorBase.Kd = 0.01;
+
+  pinMode(motorBase.in1, OUTPUT); pinMode(motorBase.in2, OUTPUT);
+  pinMode(motorBase.encA, INPUT); pinMode(motorBase.encB, INPUT);
+  attachInterrupt(digitalPinToInterrupt(motorBase.encA), readEncoderBase, RISING);
+  ledcSetup(motorBase.pwmChannel, 5000, 8);
+  ledcAttachPin(motorBase.ena, motorBase.pwmChannel);
+  motorBase.previousTime = micros();
+
+  // Hombro
+  motorHombro.name = "Hombro";
+  motorHombro.in1 = 4; motorHombro.in2 = 5; motorHombro.ena = 26;
+  motorHombro.encA = 19; motorHombro.encB = 18;
+  motorHombro.pwmChannel = 1;
+ motorHombro.pulsesPerTurn = 11 * 1200 * 3.75;  // 49500
+  motorHombro.Kp = 2.0;
+  motorHombro.Ki = 0.00001;
+  motorHombro.Kd = 0.001;
+
+  pinMode(motorHombro.in1, OUTPUT); pinMode(motorHombro.in2, OUTPUT);
+  pinMode(motorHombro.encA, INPUT); pinMode(motorHombro.encB, INPUT);
+  attachInterrupt(digitalPinToInterrupt(motorHombro.encA), readEncoderHombro, RISING);
+  ledcSetup(motorHombro.pwmChannel, 5000, 8);
+  ledcAttachPin(motorHombro.ena, motorHombro.pwmChannel);
+  motorHombro.previousTime = micros();
+
+  // Codo
+  motorCodo.name = "Codo";
+  motorCodo.in1 = 16;
+  motorCodo.in2 = 17;
+  motorCodo.ena = 27;
+  motorCodo.encA = 35;
+  motorCodo.encB = 34;
+  motorCodo.pwmChannel = 2;
+  motorCodo.pulsesPerTurn = 11 * 1200 * 3.75;  // 49500
+  motorCodo.Kp = 2.0;
+  motorCodo.Ki = 0.00001;
+  motorCodo.Kd = 0.001;
+
+  pinMode(motorCodo.in1, OUTPUT); pinMode(motorCodo.in2, OUTPUT);
+  pinMode(motorCodo.encA, INPUT); pinMode(motorCodo.encB, INPUT);
+  attachInterrupt(digitalPinToInterrupt(motorCodo.encA), readEncoderCodo, RISING);
+  ledcSetup(motorCodo.pwmChannel, 5000, 8);
+  ledcAttachPin(motorCodo.ena, motorCodo.pwmChannel);
+  motorCodo.previousTime = micros();
+
+  // WiFi
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) 
+  {
+    delay(1000);
+    Serial.println("Conectando a WiFi...");
+  }
+  Serial.print("Conectado. IP: "); Serial.println(WiFi.localIP());
+  server.begin();
+
+
+  // Pala
+ motorpala.name = "pala"; 
+  motorpala.in1 = 15; motorpala.in2 = 13; motorpala.ena = 11; 
+  motorpala.encA = 12; motorpala.encB = 22; 
+  motorpala.pwmChannel = 0;
+  motorpala.pulsesPerTurn = 6600 ; 
+  motorpala.Kp = 4.0; motorpala.Ki = 0.00005; motorpala.Kd = 0.01;
+
+  pinMode(motorpala.in1, OUTPUT); pinMode(motorpala.in2, OUTPUT);
+  pinMode(motorpala.encA, INPUT); pinMode(motorpala.encB, INPUT);
+  attachInterrupt(digitalPinToInterrupt(motorpala.encA), readEncoderpala, RISING);
+  ledcSetup(motorpala.pwmChannel, 5000, 8);
+  ledcAttachPin(motorpala.ena, motorpala.pwmChannel);
+  motorpala.previousTime = micros();
+}
+
+// ---------- LOOP ----------
+void loop() 
+{
+
+  // Comprobar si hay cliente WiFi
+  WiFiClient client = server.available();
+  if (client) 
+  {
+    Serial.println("Cliente conectado.");
+    while (client.connected()) {
+      if (client.available()) {
+        String mensaje = client.readStringUntil('\n');
+        mensaje.trim();
+
+        Serial.print("Recibido: ");
+        Serial.println(mensaje);
+
+        int xIndex = mensaje.indexOf("X:");
+        int yIndex = mensaje.indexOf(",Y:");
+        if (xIndex != -1 && yIndex != -1) {
+          String xStr = mensaje.substring(xIndex + 2, yIndex);
+          String yStr = mensaje.substring(yIndex + 3);
+
+          float x_m = xStr.toFloat();
+          float y_m = yStr.toFloat();
+
+          // Guardar la nueva tarea de recogida
+          x_recibido = x_m;
+          y_recibido = y_m;
+          nuevaTarea = true;
+
+          client.println("OK");
+        } else {
+          client.println("Formato inválido");
+        }
+      }
+    }
+    client.stop();
+    Serial.println("Cliente desconectado.");
+  }
+
+  // Ejecutar secuencia de recogida → depósito si hay nueva tarea
+  if (nuevaTarea) 
+  {
+    irDeRecogidaADeposito(x_recibido, y_recibido, x_deposito_fijo, y_deposito_fijo);
+
+  }
+
+  debugPrint();
+  delay(50);
+}
+
+}
+
+
+//FUNCIÓN MOVIMIENTO DEL MOTOR A RECOGIDA Y DEPÓSITO
+void irDeRecogidaADeposito(float x_recogida, float y_recogida, float x_deposito, float y_deposito) 
+{
+  double t0, t1, t2;
+  static bool recogidaAsignada = false;
+  static bool recogidaAlcanzada = false;
+  static bool depositoAsignado = false;
+
+  const float z = ALTURA_FIJA;
+  const double L1 = 230.0;
+  const double L2 = 200.0;
+  float umbral = 5.0;
+
+  // ESCALAR coordenadas recibidas
+  float x1 = x_recogida * escala_global;
+  float y1 = y_recogida * escala_global;
+  float x2 = x_deposito;
+  float y2 = y_deposito;
+
+  // 1. Asignar posición de recogida
+  if (!recogidaAsignada) 
+  {
+    z = 0;
+    
+    if (cinematicaInversa(x1 * 1000.0, y1 * 1000.0, z, L1, L2, &t0, &t1, &t2)) {
+      motorBase.targetDegrees = rad_to_deg(t0);
+      motorHombro.targetDegrees = rad_to_deg(t1);
+      motorCodo.targetDegrees = rad_to_deg(t2);
+
+      motorBase.targetPulses = (motorBase.targetDegrees / 360.0) * motorBase.pulsesPerTurn;
+      motorHombro.targetPulses = (motorHombro.targetDegrees / 360.0) * motorHombro.pulsesPerTurn;
+      motorCodo.targetPulses = (motorCodo.targetDegrees / 360.0) * motorCodo.pulsesPerTurn;
+
+      updatePID(motorBase);   driveMotor(motorBase);
+      updatePID(motorHombro); driveMotor(motorHombro);
+      updatePID(motorCodo);   driveMotor(motorCodo);
+      
+      recogidaAsignada = true;
+    }
+  }
+
+  // 2. Control PID para llegar a recogida
+
+
+  if (recogidaAsignada && !recogidaAlcanzada) 
+  {
+    bool baseOK   = fabs(motorBase.controlSignal) < umbral;
+    bool hombroOK = fabs(motorHombro.controlSignal) < umbral;
+    bool codoOK   = fabs(motorCodo.controlSignal) < umbral;
+
+    if (baseOK && hombroOK && codoOK) 
+    {
+      recogidaAlcanzada = true;
+    }
+  }
+
+  // 3. Asignar y moverse a posición de depósito
+  if (recogidaAlcanzada && !depositoAsignado) {
+    
+    if (cinematicaInversa(x2 * 1000.0, y2 * 1000.0, z, L1, L2, &t0, &t1, &t2)) {
+      motorBase.targetDegrees = rad_to_deg(t0);
+      motorHombro.targetDegrees = rad_to_deg(t1);
+      motorCodo.targetDegrees = rad_to_deg(t2);
+
+      motorBase.targetPulses = (motorBase.targetDegrees / 360.0) * motorBase.pulsesPerTurn;
+      motorHombro.targetPulses = (motorHombro.targetDegrees / 360.0) * motorHombro.pulsesPerTurn;
+      motorCodo.targetPulses = (motorCodo.targetDegrees / 360.0) * motorCodo.pulsesPerTurn;
+
+      updatePID(motorBase);   driveMotor(motorBase);
+      updatePID(motorHombro); driveMotor(motorHombro);
+      updatePID(motorCodo);   driveMotor(motorCodo);
+      
+      depositoAsignado = true;
+    }
+    nuevaTarea = false;
+  }
+}
+
+
+
+void moverPalaAGrados(float gradosObjetivo) 
+{
+  motorBase.targetDegrees = gradosObjetivo;
+  motorBase.targetPulses = (motorBase.targetDegrees / 360.0) * motorBase.pulsesPerTurn;
+
+  updatePID(motorBase);   // Calcula nueva señal de control
+  driveMotor(motorBase);  // Aplica movimiento al motor
+}
